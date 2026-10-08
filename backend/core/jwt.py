@@ -8,11 +8,14 @@ from jose import JWTError, jwt
 from backend.core.config import settings
 
 
-def create_access_token(subject: str) -> str:
-    """Create a signed bearer token with a two-hour default lifetime."""
-    expires_at = datetime.now(UTC) + timedelta(
-        minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+def create_access_token(subject: str, expires_minutes: int | None = None) -> str:
+    """Create a signed bearer token.
+
+    ``expires_minutes`` overrides the default lifetime (used by 'Remember me'
+    logins to issue a 1-day session instead of the two-hour default).
+    """
+    lifetime = expires_minutes or settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    expires_at = datetime.now(UTC) + timedelta(minutes=lifetime)
     payload: dict[str, Any] = {"sub": subject, "exp": expires_at}
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 

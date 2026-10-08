@@ -20,7 +20,9 @@ export interface User {
 interface AuthState {
   user: User | null
   token: string | null
-  login: (email: string, password: string) => Promise<User>
+  /** Error surfaced from the GitHub OAuth redirect (?oauth_error=...). */
+  oauthError: string | null
+  login: (email: string, password: string, rememberMe?: boolean) => Promise<User>
   refreshCurrentUser: () => Promise<User | null>
   requestSignup: (
     username: string,
@@ -33,8 +35,9 @@ interface AuthState {
   resetPassword: (email: string, otp: string, newPassword: string) => Promise<{ message: string }>
   loginWithToken: (token: string, partialUser?: Partial<User>) => Promise<User>
   loginWithConnectedGitHub: () => Promise<User>
-  getGitHubOAuthUrl: () => Promise<{ configured: boolean; url: string | null; has_pat: boolean }>
+  getGitHubOAuthUrl: (state?: string) => Promise<{ configured: boolean; url: string | null; has_pat: boolean }>
   updateUser: (partial: Partial<User>) => void
+  setOAuthError: (message: string | null) => void
   logout: () => void
 }
 
@@ -74,14 +77,55 @@ function loadToken(): string | null {
   }
 }
 
-function persistSession(user: User | null, token: string | null) {
+/** Persisted UTC ms timestamp at which the access token expires. */
+const TOKEN_EXPIRY_KEY = 'osa-token-expires-at'
+
+function readTokenExpiresAt(): number | null {
+  try {
+    const raw = localStorage.getItem(TOKEN_EXPIRY_KEY)
+    if (!raw) return null
+    const parsed = Number.parseInt(raw, 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function isSessionExpired(): boolean {
+  const expiresAt = readTokenExpiresAt()
+  return expiresAt !== null && Date.now() >= expiresAt
+}
+
+function clearExpiredSession(): void {
+  if (!isSessionExpired()) return
+  try {
+    localStorage.removeItem('osa-user')
+    localStorage.removeItem('osa-token')
+    localStorage.removeItem(TOKEN_EXPIRY_KEY)
+  } catch {
+    // best effort
+  }
+}
+
+function persistTokenExpiry(expiresAtMs: number | null): void {
+  try {
+    if (expiresAtMs !== null) localStorage.setItem(TOKEN_EXPIRY_KEY, String(expiresAtMs))
+    else localStorage.removeItem(TOKEN_EXPIRY_KEY)
+  } catch {
+    // best effort
+  }
+}
+
+function persistSession(user: User | null, token: string | null, expiresAtMs: number | null = null) {
   try {
     if (user && token) {
       localStorage.setItem('osa-user', JSON.stringify({ ...user, token }))
       localStorage.setItem('osa-token', token)
+      if (expiresAtMs !== null) persistTokenExpiry(expiresAtMs)
     } else {
       localStorage.removeItem('osa-user')
       localStorage.removeItem('osa-token')
+      persistTokenExpiry(null)
     }
   } catch {
     // best effort
@@ -100,6 +144,31 @@ function extractErrorMessage(data: unknown, fallback: string): string {
     if (typeof errObj.message === 'string') return errObj.message
   }
   return fallback
+}
+
+/** Fetch /me and throw on failure — used when a token must be verified. */
+async function fetchProfileStrict(accessToken: string): Promise<User> {
+  const response = await fetch('/api/v1/auth/me', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) {
+    throw new Error('Sign-in could not be verified. Please log in again.')
+  }
+  const profile = await response.json()
+  const status = profile.account_status || profile.accountStatus || 'active'
+  return {
+    id: profile.id,
+    username: profile.username || 'contributor',
+    email: profile.email || '',
+    token: accessToken,
+    role: profile.role === 'admin' ? 'admin' : 'user',
+    account_status: status === 'suspended' || status === 'banned' ? status : 'active',
+    accountStatus: status === 'suspended' || status === 'banned' ? status : 'active',
+    skill_level: profile.skill_level || undefined,
+    user_context: profile.user_context || undefined,
+    github_username: profile.github_username || undefined,
+    avatar_url: profile.avatar_url || undefined,
+  }
 }
 
 async function fetchProfile(accessToken: string, fallback: User): Promise<User> {
@@ -123,40 +192,73 @@ async function fetchProfile(accessToken: string, fallback: User): Promise<User> 
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
-  user: loadUser(),
+  // Drop any session whose token has already expired before trusting storage.
+  user: (clearExpiredSession(), loadUser()),
   token: loadToken(),
+  oauthError: null,
 
   updateUser: (partial: Partial<User>) => {
     const current = get().user
     if (!current) return
     const updated: User = { ...current, ...partial }
-    persistSession(updated, get().token)
+    persistSession(updated, get().token, readTokenExpiresAt())
     set({ user: updated })
   },
 
-  login: async (email, password) => {
+  setOAuthError: (message: string | null) => set({ oauthError: message }),
+
+  login: async (email, password, rememberMe = false) => {
     const res = await fetch('/api/v1/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password, remember_me: rememberMe }),
     })
     if (!res.ok) throw new Error(extractErrorMessage(await res.json().catch(() => null), 'Invalid email or password'))
-    const { access_token } = await res.json()
-    const fallback: User = {
-      username: email.split('@')[0] || 'contributor',
-      email,
-      token: access_token,
-      role: 'user',
-      account_status: 'active',
-      accountStatus: 'active',
+    const data = await res.json()
+    const { access_token } = data
+    // Server-provided expiry wins; otherwise estimate from the chosen mode.
+    const expiresAtMs = data.expires_at
+      ? new Date(data.expires_at).getTime()
+      : Date.now() + (rememberMe ? 24 : 2) * 60 * 60 * 1000
+    let user: User
+    if (data.user) {
+      const p = data.user
+      const status = p.account_status || p.accountStatus || 'active'
+      user = {
+        id: p.id,
+        username: p.username || email.split('@')[0] || 'contributor',
+        email: p.email || email,
+        token: access_token,
+        role: p.role === 'admin' ? 'admin' : 'user',
+        account_status: status === 'suspended' || status === 'banned' ? status : 'active',
+        accountStatus: status === 'suspended' || status === 'banned' ? status : 'active',
+        skill_level: p.skill_level || undefined,
+        user_context: p.user_context || undefined,
+        github_username: p.github_username || undefined,
+        avatar_url: p.avatar_url || undefined,
+      }
+    } else {
+      const fallback: User = {
+        username: email.split('@')[0] || 'contributor',
+        email,
+        token: access_token,
+        role: 'user',
+        account_status: 'active',
+        accountStatus: 'active',
+      }
+      user = await fetchProfile(access_token, fallback)
     }
-    const user = await fetchProfile(access_token, fallback)
-    persistSession(user, access_token)
+    persistSession(user, access_token, expiresAtMs)
     set({ user, token: access_token })
     return user
   },
 
   refreshCurrentUser: async () => {
+    if (isSessionExpired()) {
+      persistSession(null, null)
+      set({ user: null, token: null })
+      return null
+    }
     const token = loadToken()
     if (!token) {
       set({ user: null, token: null })
@@ -228,7 +330,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       accountStatus: 'active',
     }
     const user = await fetchProfile(access_token, fallback)
-    persistSession(user, access_token)
+    persistSession(user, access_token, Date.now() + 2 * 60 * 60 * 1000)
     set({ user, token: access_token })
     return user
   },
@@ -258,23 +360,24 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   loginWithToken: async (token: string, partialUser?: Partial<User>) => {
-    const fallback: User = {
-      username: partialUser?.username || 'developer',
-      email: partialUser?.email || '',
-      token,
-      avatar_url: partialUser?.avatar_url,
-      role: partialUser?.role || 'user',
-      account_status: 'active',
-      accountStatus: 'active',
+    // Verify the token against /me before trusting it — never keep the user
+    // "logged in" on an unverifiable token.
+    const user = await fetchProfileStrict(token)
+    const merged: User = {
+      ...user,
+      username: user.username || partialUser?.username || 'developer',
+      avatar_url: user.avatar_url || partialUser?.avatar_url,
     }
-    const user = await fetchProfile(token, fallback)
-    persistSession(user, token)
-    set({ user, token })
-    return user
+    // OAuth-issued sessions follow the same 1-day window as remember-me.
+    const expiresAtMs = Date.now() + 24 * 60 * 60 * 1000
+    persistSession(merged, token, expiresAtMs)
+    set({ user: merged, token })
+    return merged
   },
 
-  getGitHubOAuthUrl: async () => {
-    const res = await fetch('/api/v1/auth/github/url')
+  getGitHubOAuthUrl: async (state?: string) => {
+    const suffix = state ? `?state=${encodeURIComponent(state)}` : ''
+    const res = await fetch(`/api/v1/auth/github/url${suffix}`)
     if (!res.ok) {
       return { configured: false, url: null, has_pat: false }
     }
@@ -300,7 +403,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       accountStatus: 'active',
     }
     const user = await fetchProfile(access_token, fallback)
-    persistSession(user, access_token)
+    persistSession(user, access_token, Date.now() + 24 * 60 * 60 * 1000)
     set({ user, token: access_token })
     return user
   },

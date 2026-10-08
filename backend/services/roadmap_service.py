@@ -12,7 +12,9 @@ from sqlalchemy.orm import selectinload
 from backend.models.roadmap import Roadmap
 from backend.models.roadmap_step import RoadmapStep
 from backend.models.user_roadmap_progress import UserRoadmapProgress
+from backend.services import rewards_service
 from backend.schemas.roadmaps import (
+    PersonalizedRoadmapSyncStep,
     ProgressCreate,
     ProgressUpdate,
     RoadmapCreate,
@@ -149,6 +151,18 @@ async def delete_step(session: AsyncSession, roadmap_id: int, step_id: int) -> b
 # ── Progress ──
 
 
+async def _award_step_if_newly_completed(
+    session: AsyncSession, user_id: uuid.UUID, roadmap_id: int, step_id: int
+) -> None:
+    """Credit learning points when a roadmap step flips to completed."""
+    step_title = await session.scalar(
+        select(RoadmapStep.title).where(RoadmapStep.id == step_id)
+    )
+    await rewards_service.award_roadmap_step(
+        session, user_id, roadmap_id, step_id, step_title
+    )
+
+
 async def upsert_progress(
     session: AsyncSession, payload: ProgressCreate
 ) -> UserRoadmapProgress:
@@ -162,6 +176,7 @@ async def upsert_progress(
     entry = result.scalar_one_or_none()
 
     now = datetime.now(timezone.utc) if payload.completed else None
+    was_completed = bool(entry.completed) if entry else False
 
     if entry:
         entry.completed = payload.completed
@@ -180,6 +195,11 @@ async def upsert_progress(
 
     await session.commit()
 
+    if payload.completed and not was_completed:
+        await _award_step_if_newly_completed(
+            session, payload.user_id, payload.roadmap_id, payload.step_id
+        )
+
     result = await session.execute(
         select(UserRoadmapProgress)
         .options(selectinload(UserRoadmapProgress.step))
@@ -197,11 +217,17 @@ async def update_progress(
     entry = result.scalar_one_or_none()
     if not entry:
         return None
+    was_completed = bool(entry.completed)
     entry.completed = payload.completed
     entry.completed_at = datetime.now(timezone.utc) if payload.completed else None
     if payload.metadata is not None:
         entry.extra_metadata = payload.metadata
     await session.commit()
+
+    if payload.completed and not was_completed:
+        await _award_step_if_newly_completed(
+            session, entry.user_id, entry.roadmap_id, entry.step_id
+        )
 
     result = await session.execute(
         select(UserRoadmapProgress)
@@ -251,4 +277,99 @@ async def get_roadmap_progress_summary(
         "completed_steps": completed_steps,
         "percent_complete": round(completed_steps / total_steps * 100, 1) if total_steps else 0.0,
         "entries": entries,
+    }
+
+
+async def ensure_personalized_roadmap(
+    session: AsyncSession,
+    language: str,
+    skill_level: str,
+    steps: list[PersonalizedRoadmapSyncStep] | None = None,
+    user_id: uuid.UUID | None = None,
+) -> dict:
+    """Ensure a personalized roadmap exists in PostgreSQL and retrieve user progress."""
+    norm_lang = (language or "TypeScript").strip().title()
+    norm_skill = (skill_level or "Beginner").strip().capitalize()
+    roadmap_name = f"{norm_lang} Open Source Contribution ({norm_skill})"
+
+    # 1. Look up existing roadmap or create
+    stmt = (
+        select(Roadmap)
+        .options(selectinload(Roadmap.steps))
+        .where(Roadmap.name == roadmap_name)
+    )
+    roadmap = (await session.execute(stmt)).scalar_one_or_none()
+
+    step_list = steps or []
+    if not roadmap:
+        roadmap = Roadmap(
+            name=roadmap_name,
+            description=f"Personalized open-source contribution pathway for {norm_skill.lower()} developers working with {norm_lang}.",
+        )
+        session.add(roadmap)
+        await session.flush()
+
+        for idx, s in enumerate(step_list, start=1):
+            session.add(
+                RoadmapStep(
+                    roadmap_id=roadmap.id,
+                    day_number=s.day_number or idx,
+                    title=s.title,
+                    description=s.description,
+                    expected_duration_hours=s.expected_duration_hours or idx,
+                    step_order=s.step_order or idx,
+                )
+            )
+        await session.commit()
+        roadmap = (await session.execute(stmt)).scalar_one()
+    elif step_list:
+        # If roadmap exists, ensure any missing steps are added
+        existing_days = {s.day_number: s for s in roadmap.steps}
+        added = False
+        for idx, s in enumerate(step_list, start=1):
+            day_num = s.day_number or idx
+            if day_num not in existing_days:
+                session.add(
+                    RoadmapStep(
+                        roadmap_id=roadmap.id,
+                        day_number=day_num,
+                        title=s.title,
+                        description=s.description,
+                        expected_duration_hours=s.expected_duration_hours or idx,
+                        step_order=s.step_order or idx,
+                    )
+                )
+                added = True
+        if added:
+            await session.commit()
+            roadmap = (await session.execute(stmt)).scalar_one()
+
+    # 2. Query user completions if user_id is provided
+    user_completed_step_ids: set[int] = set()
+    if user_id:
+        prog_stmt = select(UserRoadmapProgress.step_id).where(
+            UserRoadmapProgress.user_id == user_id,
+            UserRoadmapProgress.roadmap_id == roadmap.id,
+            UserRoadmapProgress.completed.is_(True),
+        )
+        user_completed_step_ids = set((await session.execute(prog_stmt)).scalars().all())
+
+    sorted_steps = sorted(roadmap.steps, key=lambda x: (x.step_order, x.day_number))
+
+    return {
+        "roadmap_id": roadmap.id,
+        "name": roadmap.name,
+        "description": roadmap.description,
+        "steps": [
+            {
+                "id": s.id,
+                "day_number": s.day_number,
+                "title": s.title,
+                "description": s.description,
+                "expected_duration_hours": s.expected_duration_hours,
+                "step_order": s.step_order,
+                "completed": s.id in user_completed_step_ids,
+            }
+            for s in sorted_steps
+        ],
     }

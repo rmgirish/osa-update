@@ -6,9 +6,9 @@ and repository discovery for skill assessments.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
-import random
 import time
 from typing import Any
 
@@ -26,6 +26,28 @@ CACHE_TTL_RATE_LIMITED_SECONDS = 900  # 15 minutes
 # In-memory cache structures
 _CONTRIBUTORS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _USER_STATS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# Last known-good profile stats per user, kept indefinitely so that GitHub
+# rate limiting can degrade gracefully to slightly-stale real data instead of
+# empty states or fabricated numbers.
+_USER_STATS_LAST_GOOD: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _compute_streak_days(active_dates: set[str], today: datetime.date) -> int:
+    """Count consecutive active days ending today (or yesterday).
+
+    ``active_dates`` holds ``YYYY-MM-DD`` strings derived from real GitHub
+    activity — no synthetic backfilling.
+    """
+    day = today
+    if day.strftime("%Y-%m-%d") not in active_dates:
+        day = day - datetime.timedelta(days=1)
+        if day.strftime("%Y-%m-%d") not in active_dates:
+            return 0
+    streak = 0
+    while day.strftime("%Y-%m-%d") in active_dates:
+        streak += 1
+        day = day - datetime.timedelta(days=1)
+    return streak
 
 # Pre-seeded curated contributors for standard dataset to eliminate GitHub API calls
 PRESEEDED_CONTRIBUTORS: dict[str, list[dict[str, Any]]] = {
@@ -245,6 +267,8 @@ class GitHubService:
         if cached and cached[0] > now:
             return cached[1]
 
+        rate_limited = False
+
         headers: dict[str, str] = {
             "Accept": "application/vnd.github+json",
             "User-Agent": "OpenSourceAssist-Platform/1.0",
@@ -264,6 +288,9 @@ class GitHubService:
                 )
                 if user_res.status_code == 200:
                     gh_user = user_res.json()
+                elif user_res.status_code in (403, 429):
+                    rate_limited = True
+                    logger.warning("GitHub profile fetch rate-limited for %s", clean_user)
             except Exception as exc:
                 logger.warning("Failed to fetch GitHub profile for %s: %s", clean_user, exc)
 
@@ -274,6 +301,9 @@ class GitHubService:
                 )
                 if events_res.status_code == 200:
                     events = events_res.json()
+                elif events_res.status_code in (403, 429):
+                    rate_limited = True
+                    logger.warning("GitHub events fetch rate-limited for %s", clean_user)
             except Exception as exc:
                 logger.warning("Failed to fetch GitHub events for %s: %s", clean_user, exc)
 
@@ -284,23 +314,38 @@ class GitHubService:
                 )
                 if repos_res.status_code == 200:
                     repos = repos_res.json()
+                elif repos_res.status_code in (403, 429):
+                    rate_limited = True
+                    logger.warning("GitHub repos fetch rate-limited for %s", clean_user)
             except Exception as exc:
                 logger.warning("Failed to fetch GitHub repos for %s: %s", clean_user, exc)
 
         if not gh_user:
+            # Display-only fallback built from the requested username. No fake
+            # bio, follower, or account-age data: unknown fields stay empty.
             gh_user = {
                 "login": clean_user,
                 "name": clean_user.capitalize(),
                 "avatar_url": f"https://github.com/{clean_user}.png",
                 "html_url": f"https://github.com/{clean_user}",
-                "bio": "Open Source Contributor & Developer",
-                "public_repos": len(repos) if repos else 12,
-                "followers": 1,
+                "bio": None,
+                "public_repos": len(repos),
+                "followers": 0,
                 "following": 0,
-                "created_at": "2025-06-01T00:00:00Z",
-                "location": "Global",
-                "company": "Open Source Community",
+                "created_at": None,
+                "location": None,
+                "company": None,
             }
+
+        if rate_limited:
+            # Degrade gracefully: prefer slightly-stale real data over an
+            # empty response when GitHub is rate-limiting us.
+            stale = _USER_STATS_LAST_GOOD.get(clean_user.lower())
+            if stale:
+                degraded = dict(stale[1])
+                degraded["rate_limited"] = True
+                logger.info("Serving stale GitHub stats for %s (rate-limited)", clean_user)
+                return degraded
 
         push_events = [e for e in events if e.get("type") == "PushEvent"]
         create_events = [e for e in events if e.get("type") == "CreateEvent"]
@@ -311,17 +356,31 @@ class GitHubService:
             commits = pe.get("payload", {}).get("commits", [])
             total_push_commits += len(commits) if commits else 1
 
-        public_repos_count = gh_user.get("public_repos", len(repos))
-        followers_count = gh_user.get("followers", 0)
+        public_repos_count = gh_user.get("public_repos") if gh_user.get("public_repos") is not None else len(repos)
+        followers_count = gh_user.get("followers") or 0
 
-        base_points = 250
+        base_points = 0
         repo_points = public_repos_count * 35
         commit_points = max(len(push_events), total_push_commits) * 15
         event_points = len(events) * 10
         follower_points = followers_count * 15
         total_points = base_points + repo_points + commit_points + event_points + follower_points
 
-        streak_days = 6 if len(events) > 10 else (3 if len(events) > 0 else 1)
+        # Real activity calendar: events plus repository push dates, shared by
+        # the streak calculation and the heatmap below.
+        event_date_counts: dict[str, int] = {}
+        for ev in events:
+            c_at = ev.get("created_at")
+            if c_at:
+                d_str = c_at[:10]
+                event_date_counts[d_str] = event_date_counts.get(d_str, 0) + 1
+        for r in repos:
+            u_at = r.get("updated_at") or r.get("pushed_at")
+            if u_at:
+                d_str = u_at[:10]
+                event_date_counts[d_str] = event_date_counts.get(d_str, 0) + 1
+
+        streak_days = _compute_streak_days(set(event_date_counts), datetime.date.today())
 
         if total_points >= 2000:
             rank = "Top 5% · Gold Contributor"
@@ -332,8 +391,11 @@ class GitHubService:
         elif total_points >= 500:
             rank = "Top 25% · Bronze Contributor"
             tier = "Bronze"
-        else:
+        elif total_points > 0:
             rank = "Rising Contributor"
+            tier = "Novice"
+        else:
+            rank = "Getting Started"
             tier = "Novice"
 
         lang_counts: dict[str, int] = {}
@@ -367,7 +429,12 @@ class GitHubService:
 
         has_ai = any("ai" in (r.get("name") or "").lower() or "ml" in (r.get("name") or "").lower() for r in repos)
         has_security = any("sentry" in (r.get("name") or "").lower() or "ocean" in (r.get("name") or "").lower() for r in repos)
+        has_project_activity = (
+            any("open-source-assist" in str(r.get("full_name") or r.get("name") or "").lower() for r in repos)
+            or any("open-source-assist" in str((ev.get("repo") or {}).get("name", "")).lower() for ev in events)
+        )
 
+        now_month_year = datetime.datetime.now(datetime.timezone.utc).strftime("%B %Y")
         badges = [
             {
                 "id": "repo_architect",
@@ -377,17 +444,17 @@ class GitHubService:
                 "tier": "Gold" if public_repos_count >= 20 else "Silver",
                 "unlocked": public_repos_count >= 5,
                 "progress": min(100, int(public_repos_count / 20 * 100)),
-                "unlocked_at": "June 2025",
+                "unlocked_at": None,
             },
             {
                 "id": "polyglot",
                 "title": "Polyglot Hacker",
-                "description": f"Proficient across {len(languages)} technologies ({', '.join(l['name'] for l in languages[:3])})",
+                "description": f"Proficient across {len(languages)} technologies ({', '.join(l['name'] for l in languages[:3]) if languages else 'None'})",
                 "icon": "Code2",
                 "tier": "Gold",
                 "unlocked": len(languages) >= 3,
                 "progress": 100 if len(languages) >= 3 else int(len(languages) / 3 * 100),
-                "unlocked_at": "July 2025",
+                "unlocked_at": None,
             },
             {
                 "id": "commit_trailblazer",
@@ -397,27 +464,27 @@ class GitHubService:
                 "tier": "Silver",
                 "unlocked": len(push_events) >= 10,
                 "progress": min(100, int(len(push_events) / 20 * 100)),
-                "unlocked_at": "August 2025",
+                "unlocked_at": None,
             },
             {
                 "id": "open_source_ally",
                 "title": "Open Source Ally",
-                "description": "Active collaborator on Arul-Ananth/open-source-assist",
+                "description": "Contributed to the open-source-assist project",
                 "icon": "Users",
                 "tier": "Diamond",
-                "unlocked": True,
-                "progress": 100,
-                "unlocked_at": "September 2026",
+                "unlocked": has_project_activity,
+                "progress": 100 if has_project_activity else 0,
+                "unlocked_at": None,
             },
             {
                 "id": "security_sentinel",
                 "title": "Security Sentinel",
-                "description": "Architect of security monitoring suite",
+                "description": "Maintains security-focused repositories",
                 "icon": "Shield",
                 "tier": "Silver",
                 "unlocked": has_security,
-                "progress": 100 if has_security else 40,
-                "unlocked_at": "September 2026" if has_security else None,
+                "progress": 100 if has_security else 0,
+                "unlocked_at": now_month_year if has_security else None,
             },
             {
                 "id": "ai_innovator",
@@ -427,7 +494,7 @@ class GitHubService:
                 "tier": "Gold",
                 "unlocked": has_ai,
                 "progress": 100 if has_ai else 50,
-                "unlocked_at": "August 2025" if has_ai else None,
+                "unlocked_at": None,
             },
             {
                 "id": "streak_master",
@@ -437,7 +504,7 @@ class GitHubService:
                 "tier": "Gold",
                 "unlocked": streak_days >= 3,
                 "progress": min(100, int(streak_days / 7 * 100)),
-                "unlocked_at": "Current Streak",
+                "unlocked_at": "Current Streak" if streak_days >= 3 else None,
             },
             {
                 "id": "first_pr",
@@ -446,8 +513,8 @@ class GitHubService:
                 "icon": "GitPullRequest",
                 "tier": "Bronze",
                 "unlocked": len(pr_events) > 0,
-                "progress": 100 if len(pr_events) > 0 else 60,
-                "unlocked_at": None,
+                "progress": 100 if len(pr_events) > 0 else 0,
+                "unlocked_at": now_month_year if len(pr_events) > 0 else None,
             },
         ]
 
@@ -525,33 +592,14 @@ class GitHubService:
                     "icon": "GitPullRequest",
                 })
 
-        event_date_counts: dict[str, int] = {}
-        for ev in events:
-            c_at = ev.get("created_at")
-            if c_at:
-                d_str = c_at[:10]
-                event_date_counts[d_str] = event_date_counts.get(d_str, 0) + 1
-
-        for r in repos:
-            u_at = r.get("updated_at")
-            if u_at:
-                d_str = u_at[:10]
-                event_date_counts[d_str] = event_date_counts.get(d_str, 0) + 1
-
         today = datetime.date.today()
         heatmap_days: list[dict[str, Any]] = []
         total_contributions = 0
-
-        rng = random.Random(clean_user)
 
         for i in range(364, -1, -1):
             day_date = today - datetime.timedelta(days=i)
             d_str = day_date.strftime("%Y-%m-%d")
             c = event_date_counts.get(d_str, 0)
-
-            if c == 0:
-                if rng.random() < 0.28:
-                    c = rng.choice([1, 2, 3])
 
             if c == 0:
                 level = 0
@@ -577,7 +625,7 @@ class GitHubService:
                 "name": gh_user.get("name") or gh_user.get("login", clean_user),
                 "avatar_url": gh_user.get("avatar_url") or f"https://github.com/{clean_user}.png",
                 "html_url": gh_user.get("html_url") or f"https://github.com/{clean_user}",
-                "bio": gh_user.get("bio") or "Open source enthusiast & developer",
+                "bio": gh_user.get("bio") or "",
                 "company": gh_user.get("company"),
                 "location": gh_user.get("location"),
                 "public_repos": public_repos_count,
@@ -614,7 +662,9 @@ class GitHubService:
             "heatmap": heatmap_days,
         }
 
+        data_result["rate_limited"] = rate_limited
         _USER_STATS_CACHE[clean_user.lower()] = (now + 600, data_result)
+        _USER_STATS_LAST_GOOD[clean_user.lower()] = (now, data_result)
         return data_result
 
 

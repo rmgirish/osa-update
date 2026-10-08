@@ -17,7 +17,13 @@ class Base(DeclarativeBase):
     """Base class for all ORM models."""
 
 
-engine: AsyncEngine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine: AsyncEngine = create_async_engine(
+    settings.database_url,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=300,
+    pool_pre_ping=True,
+)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -28,14 +34,39 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """Create all ORM tables if they do not exist yet and ensure schema sync."""
+    """Create any ORM tables that do not exist yet.
+
+    Schema changes for existing databases are owned by Alembic migrations
+    (`uv run alembic upgrade head`); this helper only bootstraps fresh ones and
+    applies idempotent forum-column backfills for older databases.
+    """
     import backend.models  # noqa: F401
-    from sqlalchemy import text
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        if conn.dialect.name == "postgresql":
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS github_username VARCHAR(100);"))
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS github_access_token VARCHAR(255);"))
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS user_context VARCHAR(2000);"))
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS skill_level VARCHAR(50);"))
+        if engine.dialect.name == "postgresql":
+            from sqlalchemy import text
+
+            migrations = [
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'general';",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS reply_count INTEGER DEFAULT 0;",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS views_count INTEGER DEFAULT 0;",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS is_solved BOOLEAN DEFAULT false;",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS accepted_answer_id INTEGER;",
+                "ALTER TABLE forum_threads ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ DEFAULT NOW();",
+                "ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS is_opening_post BOOLEAN DEFAULT false;",
+                "ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS upvotes INTEGER DEFAULT 0;",
+                "ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;",
+                "ALTER TABLE forum_bans ADD COLUMN IF NOT EXISTS banned_by UUID REFERENCES users(id) ON DELETE SET NULL;",
+                "ALTER TABLE forum_bans ADD COLUMN IF NOT EXISTS reason VARCHAR(500);",
+                "ALTER TABLE forum_bans ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+                "CREATE INDEX IF NOT EXISTS ix_forum_posts_thread_created ON forum_posts(thread_id, created_at);",
+                "CREATE INDEX IF NOT EXISTS ix_forum_threads_category ON forum_threads(category);",
+                "CREATE INDEX IF NOT EXISTS ix_forum_threads_last_activity ON forum_threads(last_activity_at);",
+            ]
+            for stmt in migrations:
+                try:
+                    await conn.execute(text(stmt))
+                except Exception:
+                    pass

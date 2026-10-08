@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: open_source_assist_db
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-open_source_assist}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-open_source_assist}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app_network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: open_source_assist_qdrant
+    restart: always
+    environment:
+      - QDRANT__SERVICE__ENABLE_CORS=true
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - app_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: open_source_assist_backend
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+      - SERVER_RELOAD=false
+    networks:
+      - app_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: open_source_assist_frontend
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - backend
+    networks:
+      - app_network
+
+volumes:
+  postgres_data:
+  qdrant_storage:
+
+networks:
+  app_network:
+    driver: bridge

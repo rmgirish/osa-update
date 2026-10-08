@@ -1,11 +1,14 @@
 """Business logic for user registration, verification, authentication, and password recovery."""
 
+import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core.config import settings
 from backend.core.jwt import create_access_token
 from backend.core.security import hash_password, verify_password
 from backend.models.otp_model import OTPPurpose
@@ -96,8 +99,14 @@ class AuthService:
         return create_access_token(str(user.id))
 
     @staticmethod
-    async def login(db: AsyncSession, email: str, password: str) -> str:
-        """Verify user credentials and return signed access token."""
+    async def login(
+        db: AsyncSession, email: str, password: str, remember_me: bool = False
+    ) -> tuple[str, User, datetime]:
+        """Verify credentials and return the signed token, the User, and its expiry.
+
+        ``remember_me=True`` issues a 1-day token (``REMEMBER_ME_EXPIRE_MINUTES``)
+        instead of the default two-hour lifetime.
+        """
         normalized = email.strip().lower()
         from sqlalchemy import or_
         user = await db.scalar(
@@ -106,13 +115,22 @@ class AuthService:
             )
         )
 
-        if user is None or not verify_password(password, user.password_hash):
+        if user is None:
+            raise ValueError("Invalid email or password")
+
+        is_valid = await asyncio.to_thread(verify_password, password, user.password_hash)
+        if not is_valid:
             raise ValueError("Invalid email or password")
 
         if not user.is_active or getattr(user, "account_status", "active") != "active":
             raise ValueError("Account is deactivated or suspended")
 
-        return create_access_token(str(user.id))
+        lifetime = settings.REMEMBER_ME_EXPIRE_MINUTES if remember_me else None
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=lifetime or settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        token = create_access_token(str(user.id), expires_minutes=lifetime)
+        return token, user, expires_at
 
     @staticmethod
     async def request_password_reset(db: AsyncSession, email: str) -> None:

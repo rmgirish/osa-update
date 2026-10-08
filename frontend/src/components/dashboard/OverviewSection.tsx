@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   ExternalLink,
   Flame,
@@ -14,6 +15,8 @@ import {
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, Badge, Button } from '@/components/ui'
 import { useAuthStore } from '@/lib/auth-store'
 import { useGitHubUserProfile } from '@/lib/use-github-profile'
+import { buildHeatmapWeeks, heatLevelColor, HEATMAP_WEEKDAY_LABELS } from '@/lib/heatmap'
+import { fetchRewardsSummary } from '@/lib/rewards-api'
 import { SkillAssessmentModal } from '@/components/roadmap/SkillAssessmentModal'
 import { BadgesSection } from './BadgesSection'
 import { RecentActivitySection } from './RecentActivitySection'
@@ -35,6 +38,15 @@ interface OverviewSectionProps {
 export function OverviewSection({ onNavigate }: OverviewSectionProps) {
   const user = useAuthStore((s) => s.user)
   const { data, isLoading, refetch, isFetching } = useGitHubUserProfile()
+  // Live redeemable balance from the rewards ledger; falls back to the
+  // GitHub-derived stat while the backend is unreachable.
+  const { data: rewardsSummary } = useQuery({
+    queryKey: ['rewards', 'summary'],
+    queryFn: fetchRewardsSummary,
+    retry: false,
+    staleTime: 30_000,
+  })
+  const latestEarn = rewardsSummary?.recent.find((entry) => entry.points > 0)
   const [hoveredDay, setHoveredDay] = useState<{ date: string; count: number } | null>(null)
   const [isAssessmentModalOpen, setIsAssessmentModalOpen] = useState(false)
 
@@ -43,6 +55,7 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
   const badges = data?.badges ?? []
   const activities = data?.recent_activity ?? []
   const heatmap = data?.heatmap ?? []
+  const heatmapWeeks = useMemo(() => buildHeatmapWeeks(heatmap), [heatmap])
   const languages = data?.languages ?? []
 
   const displayName = profile?.name || user?.username || 'contributor'
@@ -55,7 +68,7 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
         month: 'short',
         year: 'numeric',
       })
-    : 'June 2025'
+    : 'Recently'
 
   return (
     <div className="animate-fade-up space-y-6">
@@ -126,11 +139,11 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
               <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
                 <span className="flex items-center gap-1 rounded-md border border-border/60 bg-background/50 px-2 py-0.5 font-mono">
                   <BookOpen className="size-3 text-accent-text" />
-                  <span>{profile?.public_repos ?? stats?.total_repos ?? 30} Repos</span>
+                  <span>{profile?.public_repos ?? stats?.total_repos ?? 0} Repos</span>
                 </span>
                 <span className="flex items-center gap-1 rounded-md border border-border/60 bg-background/50 px-2 py-0.5 font-mono">
                   <UsersIcon className="size-3 text-accent-text" />
-                  <span>{profile?.followers ?? 1} Follower</span>
+                  <span>{profile?.followers ?? 0} Followers</span>
                 </span>
                 <span className="flex items-center gap-1 rounded-md border border-border/60 bg-background/50 px-2 py-0.5 font-mono">
                   <Calendar className="size-3 text-muted-foreground" />
@@ -209,9 +222,15 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
             </div>
             <div className="mt-2 flex items-baseline gap-2">
               <p className="font-mono text-2xl font-bold tracking-tight text-foreground">
-                {isLoading ? '...' : (stats?.total_points ?? 1945).toLocaleString()}
+                {rewardsSummary
+                  ? rewardsSummary.balance.toLocaleString()
+                  : isLoading
+                    ? '...'
+                    : (stats?.total_points ?? 0).toLocaleString()}
               </p>
-              <span className="text-[10px] font-semibold text-emerald-400">+25 pts earned</span>
+              <span className="text-[10px] font-semibold text-emerald-400">
+                {latestEarn ? `+${latestEarn.points} pts earned` : 'Earn by contributing'}
+              </span>
             </div>
             <p className="mt-1 text-[11px] text-muted-foreground">Redeemable for rewards</p>
           </CardContent>
@@ -223,16 +242,18 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
             <div className="flex items-center justify-between">
               <p className="text-xs font-medium text-muted-foreground">Active Streak</p>
               <span className="flex size-7 items-center justify-center rounded-lg border border-orange-500/30 bg-orange-500/10 text-orange-400">
-                <Flame className="size-3.5 animate-pulse" />
+                <Flame className="size-3.5" />
               </span>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
               <p className="font-mono text-2xl font-bold tracking-tight text-foreground">
-                {isLoading ? '...' : `${stats?.streak_days ?? 6} Days`}
+                {isLoading ? '...' : `${stats?.streak_days ?? 0} Days`}
               </p>
-              <span className="text-[10px] font-semibold text-orange-400">Active</span>
+              <span className="text-[10px] font-semibold text-orange-400">
+                {stats?.streak_days ? 'Active' : 'Inactive'}
+              </span>
             </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">Personal best: 14 days</p>
+            <p className="mt-1 text-[11px] text-muted-foreground">Based on GitHub events</p>
           </CardContent>
         </Card>
 
@@ -268,7 +289,7 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
             </div>
             <div className="mt-2 flex items-baseline gap-2">
               <p className="font-mono text-lg font-bold tracking-tight text-foreground">
-                {isLoading ? '...' : (stats?.rank ?? 'Top 12% · Silver Contributor')}
+                {isLoading ? '...' : (stats?.rank ?? 'Getting Started')}
               </p>
             </div>
             <p className="mt-1 text-[11px] text-muted-foreground">Based on GitHub contributions</p>
@@ -287,7 +308,7 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
                 <CardDescription>
                   <span className="flex items-center gap-4">
                     <span>
-                      {stats?.total_contributions || 248} contributions in the last year
+                      {stats?.total_contributions ?? 0} contributions in the last year
                     </span>
                     <span className="flex items-center gap-1.5">
                       <span className="text-[10px] text-muted-foreground">Less</span>
@@ -316,67 +337,62 @@ export function OverviewSection({ onNavigate }: OverviewSectionProps) {
             </div>
           </CardHeader>
           <CardContent>
-            {/* Real 52-week contribution heatmap */}
+            {/* Contribution heatmap — calendar-week aligned, labelled by year/month */}
             <div className="overflow-x-auto pb-1">
-              <div className="min-w-[660px]">
-                {/* Month labels */}
-                <div className="mb-1.5 flex gap-[3px] pl-7 font-mono text-[10px] text-muted-foreground">
-                  {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map(
-                    (month) => (
-                      <span key={month} className="w-[calc(13px*4.4)]">
-                        {month}
-                      </span>
-                    ),
-                  )}
+              <div className="min-w-max">
+                {/* Year labels (shown only where the year changes) */}
+                <div className="flex gap-[3px] font-mono text-[10px] font-semibold text-foreground/70">
+                  <div className="w-7 shrink-0" aria-hidden="true" />
+                  {heatmapWeeks.map((week, i) => (
+                    <div key={i} className="relative h-3.5 w-[13px] shrink-0">
+                      {week.yearLabel && (
+                        <span className="absolute left-0 top-0 whitespace-nowrap">{week.yearLabel}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Month labels (shown on the week a new month begins) */}
+                <div className="mb-1.5 flex gap-[3px] font-mono text-[10px] text-muted-foreground">
+                  <div className="w-7 shrink-0" aria-hidden="true" />
+                  {heatmapWeeks.map((week, i) => (
+                    <div key={i} className="relative h-3.5 w-[13px] shrink-0">
+                      {week.monthLabel && (
+                        <span className="absolute left-0 top-0 whitespace-nowrap">{week.monthLabel}</span>
+                      )}
+                    </div>
+                  ))}
                 </div>
 
                 <div className="flex gap-[3px]">
                   {/* Day labels (Mon/Wed/Fri) */}
-                  <div className="flex w-7 flex-col gap-[3px] font-mono text-[10px] text-muted-foreground">
-                    {['', 'Mon', '', 'Wed', '', 'Fri', ''].map((day, i) => (
+                  <div className="flex w-7 shrink-0 flex-col gap-[3px] font-mono text-[10px] text-muted-foreground">
+                    {HEATMAP_WEEKDAY_LABELS.map((day, i) => (
                       <span key={i} className="h-[13px] leading-[13px]">
                         {day}
                       </span>
                     ))}
                   </div>
 
-                  {/* 53 Columns of 7 Days */}
-                  {Array.from({ length: 53 }, (_, weekIdx) => {
-                    const weekDays = heatmap.slice(weekIdx * 7, weekIdx * 7 + 7)
-
-                    return (
-                      <div key={weekIdx} className="flex flex-col gap-[3px]">
-                        {Array.from({ length: 7 }, (_, dayIdx) => {
-                          const item = weekDays[dayIdx]
-                          const level = item?.level ?? (weekIdx % 3 === 0 ? 1 : 0)
-                          const count = item?.count ?? 0
-                          const date = item?.date ?? `Week ${weekIdx + 1}`
-
-                          return (
-                            <div
-                              key={dayIdx}
-                              onMouseEnter={() => setHoveredDay({ date, count })}
-                              onMouseLeave={() => setHoveredDay(null)}
-                              className="size-[13px] cursor-pointer rounded-[2px] border border-border/60 transition-transform duration-100 hover:scale-125 hover:border-accent"
-                              style={{
-                                backgroundColor:
-                                  level === 0
-                                    ? 'rgba(255, 255, 255, 0.03)'
-                                    : level === 1
-                                    ? 'rgba(249, 115, 22, 0.25)'
-                                    : level === 2
-                                    ? 'rgba(249, 115, 22, 0.50)'
-                                    : level === 3
-                                    ? 'rgba(249, 115, 22, 0.75)'
-                                    : 'rgba(249, 115, 22, 1.0)',
-                              }}
-                              title={`${count} contributions on ${date}`}
-                            />
-                          )
-                        })}
-                      </div>
-                    )
-                  })}
+                  {/* One column per calendar week (Sunday→Saturday) */}
+                  {heatmapWeeks.map((week, weekIdx) => (
+                    <div key={weekIdx} className="flex flex-col gap-[3px]">
+                      {week.cells.map((cell, dayIdx) =>
+                        cell ? (
+                          <div
+                            key={dayIdx}
+                            onMouseEnter={() => setHoveredDay({ date: cell.date, count: cell.count })}
+                            onMouseLeave={() => setHoveredDay(null)}
+                            className="size-[13px] cursor-pointer rounded-[2px] border border-border/60 transition-transform duration-100 hover:scale-125 hover:border-accent"
+                            style={{ backgroundColor: heatLevelColor(cell.level) }}
+                            title={`${cell.count} contribution${cell.count === 1 ? '' : 's'} on ${cell.date}`}
+                          />
+                        ) : (
+                          <div key={dayIdx} className="size-[13px]" aria-hidden="true" />
+                        ),
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>

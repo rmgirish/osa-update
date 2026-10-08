@@ -1,5 +1,6 @@
 """Pydantic schemas for authentication and password recovery workflows."""
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -55,6 +56,10 @@ class LoginRequest(BaseModel):
 
     email: str = Field(min_length=1, max_length=255, description="Account email address or username.")
     password: str = Field(min_length=1, max_length=128, description="Account password.")
+    remember_me: bool = Field(
+        default=False,
+        description="When true, the session lasts 1 day instead of the default two hours.",
+    )
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -78,11 +83,31 @@ class ResetPasswordRequest(BaseModel):
     )
 
 
+class UserProfileResponse(BaseModel):
+    """User profile data returned by /me endpoint."""
+
+    id: str = Field(description="User unique identifier UUID.")
+    email: EmailStr = Field(description="User account email address.")
+    username: str | None = Field(default=None, description="Account display username.")
+    github_username: str | None = Field(default=None, description="Linked GitHub account username.")
+    skill_level: str | None = Field(default=None, description="Assessed technical skill level.")
+    user_context: str | None = Field(default=None, description="Synthesized developer context.")
+    role: UserRole = Field(default="user", description="Account authorization role.")
+    account_status: AccountStatus = Field(default="active", description="Account status.")
+
+
 class TokenResponse(BaseModel):
     """Response payload containing JWT access token."""
 
     access_token: str = Field(description="Signed JWT access token.")
     token_type: str = Field(default="bearer", description="Bearer authentication scheme.")
+    user: UserProfileResponse | None = Field(
+        default=None, description="Authenticated user profile details."
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description="UTC instant when the token expires; clients should discard the session then.",
+    )
 
 
 class AuthResponse(BaseModel):
@@ -97,19 +122,6 @@ class MessageResponse(BaseModel):
     """Generic message response."""
 
     message: str = Field(description="Operation result message.")
-
-
-class UserProfileResponse(BaseModel):
-    """User profile data returned by /me endpoint."""
-
-    id: str = Field(description="User unique identifier UUID.")
-    email: EmailStr = Field(description="User account email address.")
-    username: str | None = Field(default=None, description="Account display username.")
-    github_username: str | None = Field(default=None, description="Linked GitHub account username.")
-    skill_level: str | None = Field(default=None, description="Assessed technical skill level.")
-    user_context: str | None = Field(default=None, description="Synthesized developer context.")
-    role: UserRole = Field(default="user", description="Account authorization role.")
-    account_status: AccountStatus = Field(default="active", description="Account status.")
 
 
 class GitHubCodeRequest(BaseModel):

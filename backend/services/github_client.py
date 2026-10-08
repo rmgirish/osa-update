@@ -70,6 +70,32 @@ class GitHubClient:
                 retry_after or "secondary rate limit" in response.text.lower()
             )
 
+            # Primary rate limit exhausted: waiting out the reset inside a
+            # request cycle would block the caller for up to an hour, so fail
+            # fast with a precise, actionable message instead of retrying.
+            if response.status_code in {403, 429} and remaining == "0" and reset:
+                try:
+                    reset_epoch = int(reset)
+                    wait_seconds = max(
+                        1, reset_epoch - int(datetime.now(timezone.utc).timestamp())
+                    )
+                    reset_time = datetime.fromtimestamp(
+                        reset_epoch, tz=timezone.utc
+                    ).strftime("%H:%M UTC")
+                except ValueError:
+                    wait_seconds, reset_time = None, None
+                detail = (
+                    f"GitHub API rate limit exhausted. Resets at {reset_time} "
+                    f"(in ~{wait_seconds}s)."
+                    if wait_seconds
+                    else "GitHub API rate limit exhausted. Try again later."
+                )
+                raise GitHubAPIError(
+                    detail,
+                    status_code=429,
+                    retry_after=str(wait_seconds) if wait_seconds else None,
+                )
+
             if secondary_limit and attempt < self.max_retries:
                 if retry_after:
                     delay = float(retry_after)
@@ -121,6 +147,17 @@ class GitHubClient:
 
     async def get_user(self, username: str) -> dict[str, Any]:
         return await self._get(f"/users/{username}")
+
+    async def list_user_events(
+        self, username: str, per_page: int = 30, page: int = 1
+    ) -> list[dict[str, Any]]:
+        """Fetch a page of a user's public GitHub activity events."""
+        payload = await self._get(
+            f"/users/{username}/events/public",
+            per_page=min(per_page, 100),
+            page=max(page, 1),
+        )
+        return payload if isinstance(payload, list) else []
 
     async def search_repositories_query(
         self,

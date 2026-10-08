@@ -27,6 +27,14 @@ class GitHubOAuthService:
     """Handles GitHub OAuth 2.0 Web Application Flow."""
 
     @staticmethod
+    def _callback_uri(redirect_uri: str | None = None) -> str:
+        """Resolve the callback URI consistently for authorization and token exchange."""
+        configured_uri = redirect_uri or settings.GITHUB_REDIRECT_URI
+        if configured_uri and configured_uri.strip():
+            return configured_uri.strip()
+        return f"{settings.FRONTEND_URL.rstrip('/')}/api/v1/auth/github/callback"
+
+    @staticmethod
     def is_configured() -> bool:
         """Check if OAuth Client ID and Secret are configured."""
         return bool(
@@ -47,7 +55,7 @@ class GitHubOAuthService:
                 "GITHUB_CLIENT_SECRET in your .env file."
             )
 
-        cb_url = redirect_uri or settings.GITHUB_REDIRECT_URI or f"{settings.FRONTEND_URL}/api/v1/auth/github/callback"
+        cb_url = cls._callback_uri(redirect_uri)
         params: dict[str, str] = {
             "client_id": settings.GITHUB_CLIENT_ID.strip(),
             "scope": "read:user,user:email",
@@ -66,7 +74,7 @@ class GitHubOAuthService:
         if not cls.is_configured():
             raise ValueError("GitHub OAuth credentials not configured.")
 
-        cb_url = redirect_uri or settings.GITHUB_REDIRECT_URI or f"{settings.FRONTEND_URL}/api/v1/auth/github/callback"
+        cb_url = cls._callback_uri(redirect_uri)
         payload = {
             "client_id": settings.GITHUB_CLIENT_ID.strip(),
             "client_secret": settings.GITHUB_CLIENT_SECRET.strip(),
@@ -79,7 +87,7 @@ class GitHubOAuthService:
         }
 
         async with httpx.AsyncClient(timeout=12.0) as client:
-            res = await client.post(GITHUB_OAUTH_TOKEN_URL, json=payload, headers=headers)
+            res = await client.post(GITHUB_OAUTH_TOKEN_URL, data=payload, headers=headers)
             if res.status_code != 200:
                 raise ValueError(f"GitHub token exchange returned HTTP {res.status_code}")
 

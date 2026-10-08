@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { RefreshCw } from 'lucide-react'
 import {
   BadgeCheck,
   CalendarClock,
@@ -34,30 +36,25 @@ import {
 } from '@/components/ui'
 import type { BadgeProps } from '@/components/ui'
 import { cn } from '@/lib/utils'
+import {
+  cancelRedemption,
+  claimDailyPoints,
+  fetchClaims,
+  fetchRewardsSummary,
+  redeemPoints,
+  syncGithubRewards,
+} from '@/lib/rewards-api'
+import { fetchMentors, type Mentor, type MentorTier } from '@/lib/mentors-api'
+import { useAuthStore } from '@/lib/auth-store'
 
 /**
  * Redeem Points module — spend contribution points on 1:1 mentor sessions.
  *
- * Preview mode: points balance and bookings persist in localStorage until the
- * rewards backend lands. Mentor catalog mirrors what the API will expose.
+ * Both the mentor catalog and the points balance come from the backend; there
+ * is no local preview state, so what you see is the authoritative account.
  */
 
-export type MentorTier = 'beginner' | 'intermediate' | 'advanced' | 'expert'
-
-export interface Mentor {
-  id: number
-  name: string
-  role: string
-  company: string
-  tier: MentorTier
-  cost: number
-  rating: number
-  sessions: number
-  languages: string[]
-  timezone: string
-  tags: string[]
-  bio: string
-}
+export type { Mentor, MentorTier } from '@/lib/mentors-api'
 
 export interface MentorBooking {
   id: number
@@ -68,10 +65,9 @@ export interface MentorBooking {
   time: string
   topic: string
   cost: number
+  /** Server ledger reference — set when the booking is synced to the backend. */
+  referenceKey?: string | null
 }
-
-const POINTS_KEY = 'osa_points_balance'
-const BOOKINGS_KEY = 'osa_mentor_bookings'
 
 /** Point cost per mentor tier — the core redeem pricing table. */
 const TIER_COSTS: Record<MentorTier, number> = {
@@ -111,186 +107,206 @@ const TIER_META: Record<
   },
 }
 
-const MENTORS: Mentor[] = [
-  {
-    id: 1,
-    name: 'Aarav Mehta',
-    role: 'Senior Backend Engineer',
-    company: 'Zerodha',
-    tier: 'beginner',
-    cost: TIER_COSTS.beginner,
-    rating: 4.9,
-    sessions: 128,
-    languages: ['Python', 'Go'],
-    timezone: 'IST (UTC+5:30)',
-    tags: ['First PR', 'Git Basics', 'Setup Help'],
-    bio: 'Guided 100+ first-time contributors through their first merged pull request.',
-  },
-  {
-    id: 2,
-    name: 'Sofia Ramirez',
-    role: 'Open Source Maintainer',
-    company: 'Expo',
-    tier: 'intermediate',
-    cost: TIER_COSTS.intermediate,
-    rating: 4.8,
-    sessions: 86,
-    languages: ['TypeScript', 'React'],
-    timezone: 'CET (UTC+1)',
-    tags: ['Code Review', 'CI/CD', 'React'],
-    bio: 'Maintains popular React Native tooling; loves unblocking stuck contributors.',
-  },
-  {
-    id: 3,
-    name: 'Kenji Tanaka',
-    role: 'Staff Engineer',
-    company: 'Rust Foundation',
-    tier: 'advanced',
-    cost: TIER_COSTS.advanced,
-    rating: 4.9,
-    sessions: 54,
-    languages: ['Rust', 'C++'],
-    timezone: 'JST (UTC+9)',
-    tags: ['Performance', 'Systems', 'Testing'],
-    bio: 'Performance specialist; can profile and untangle gnarly systems code with you.',
-  },
-  {
-    id: 4,
-    name: 'Dr. Amara Okafor',
-    role: 'Principal Engineer',
-    company: 'Moorhen Health',
-    tier: 'expert',
-    cost: TIER_COSTS.expert,
-    rating: 5.0,
-    sessions: 31,
-    languages: ['Python', 'TypeScript'],
-    timezone: 'GMT (UTC+0)',
-    tags: ['Career', 'Leadership', 'Architecture'],
-    bio: '20 years in open source; mentors future maintainers and OSS program leads.',
-  },
-  {
-    id: 5,
-    name: 'Priya Sharma',
-    role: 'DevOps Engineer',
-    company: 'Razorpay',
-    tier: 'beginner',
-    cost: TIER_COSTS.beginner,
-    rating: 4.7,
-    sessions: 97,
-    languages: ['Python', 'Docker'],
-    timezone: 'IST (UTC+5:30)',
-    tags: ['Docker', 'First PR', 'Linux'],
-    bio: 'Patient teacher for dev environments, containers and contributor workflows.',
-  },
-  {
-    id: 6,
-    name: 'Lucas Weber',
-    role: 'Core Maintainer',
-    company: 'Vite Team',
-    tier: 'intermediate',
-    cost: TIER_COSTS.intermediate,
-    rating: 4.8,
-    sessions: 73,
-    languages: ['JavaScript', 'Rust'],
-    timezone: 'GMT+2',
-    tags: ['Build Tools', 'Testing', 'Plugin APIs'],
-    bio: 'Reviews contributor PRs weekly; great for understanding maintainer expectations.',
-  },
-]
 
-const ALL_TAGS = [...new Set(MENTORS.flatMap((m) => m.tags))].sort()
-
-const readPoints = (): number => {
+function formatClaimReset(iso: string): string {
   try {
-    const raw = localStorage.getItem(POINTS_KEY)
-    const parsed = raw ? Number.parseInt(raw, 10) : NaN
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 480
+    return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(
+      new Date(iso),
+    )
   } catch {
-    return 480
-  }
-}
-
-const readBookings = (): MentorBooking[] => {
-  try {
-    const raw = localStorage.getItem(BOOKINGS_KEY)
-    return raw ? (JSON.parse(raw) as MentorBooking[]) : []
-  } catch {
-    return []
-  }
-}
-
-const writeStored = (key: string, value: unknown) => {
-  try {
-    localStorage.setItem(key, JSON.stringify(value))
-  } catch {
-    /* storage may be unavailable */
+    return 'later today'
   }
 }
 
 export function RedeemSection() {
-  const [points, setPoints] = useState<number>(readPoints)
-  const [bookings, setBookings] = useState<MentorBooking[]>(readBookings)
+  const queryClient = useQueryClient()
+  const token = useAuthStore((state) => state.token)
+  const signedIn = Boolean(token)
+
+  // Everything is backend-backed — no local preview state.
+  const { data: summary, isError: summaryError } = useQuery({
+    queryKey: ['rewards', 'summary'],
+    queryFn: fetchRewardsSummary,
+    enabled: signedIn,
+    retry: false,
+    staleTime: 30_000,
+  })
+  const { data: mentorsData, isLoading: mentorsLoading } = useQuery({
+    queryKey: ['mentors'],
+    queryFn: () => fetchMentors(),
+    staleTime: 5 * 60_000,
+  })
+  const { data: claims } = useQuery({
+    queryKey: ['rewards', 'claims'],
+    queryFn: fetchClaims,
+    enabled: signedIn,
+    retry: false,
+    staleTime: 30_000,
+  })
+
+  const mentors = mentorsData?.mentors ?? []
+  const tierCosts = (mentorsData?.tiers ?? TIER_COSTS) as Record<MentorTier, number>
+  const dailyClaim = claims?.claims.find((claim) => claim.id === 'daily')
+
   const [activeTag, setActiveTag] = useState<string | null>(null)
   const [selectedMentor, setSelectedMentor] = useState<Mentor | null>(null)
   const [redeemed, setRedeemed] = useState<MentorBooking | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [syncInfo, setSyncInfo] = useState<string | null>(null)
+  const [claimInfo, setClaimInfo] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
-  // Persist to localStorage whenever values change.
-  useEffect(() => writeStored(POINTS_KEY, points), [points])
-  useEffect(() => writeStored(BOOKINGS_KEY, bookings), [bookings])
+  const points = summary?.balance ?? 0
+
+  // Server bookings are rebuilt from the redemption ledger so the session
+  // list survives reloads and matches the authoritative balance.
+  const serverBookings: MentorBooking[] = useMemo(
+    () =>
+      (summary?.recent ?? [])
+        .filter((entry) => entry.source === 'redemption' && entry.points < 0)
+        .map((entry) => {
+          const meta = (entry.extra_metadata ?? {}) as Record<string, unknown>
+          const tier =
+            typeof meta.tier === 'string' && meta.tier in TIER_COSTS
+              ? (meta.tier as MentorTier)
+              : 'beginner'
+          return {
+            id: entry.id,
+            mentorId: typeof meta.mentor_id === 'number' ? meta.mentor_id : 0,
+            mentorName: typeof meta.mentor_name === 'string' ? meta.mentor_name : 'Mentor',
+            tier,
+            date: typeof meta.date === 'string' ? meta.date : 'TBD',
+            time: typeof meta.time === 'string' ? meta.time : 'TBD',
+            topic: typeof meta.topic === 'string' ? meta.topic : '',
+            cost: -entry.points,
+            referenceKey: entry.reference_key,
+          }
+        }),
+    [summary],
+  )
+  const allBookings = serverBookings
+
+  const tagOptions = useMemo(
+    () => [...new Set(mentors.flatMap((m) => m.tags))].sort(),
+    [mentors],
+  )
 
   const filtered = useMemo(
-    () => (activeTag ? MENTORS.filter((m) => m.tags.includes(activeTag)) : MENTORS),
-    [activeTag],
+    () => (activeTag ? mentors.filter((m) => m.tags.includes(activeTag)) : mentors),
+    [activeTag, mentors],
   )
 
   const upcoming = useMemo(
     () =>
-      [...bookings]
+      [...allBookings]
         .sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`))
         .slice(0, 3),
-    [bookings],
+    [allBookings],
   )
 
   const startRedeem = (mentor: Mentor) => setSelectedMentor(mentor)
 
-  const confirmRedeem = (date: string, time: string, topic: string) => {
-    if (!selectedMentor || points < selectedMentor.cost) return
+  const handleGithubSync = async () => {
+    if (busy) return
+    setBusy(true)
+    setActionError(null)
+    setSyncInfo(null)
+    try {
+      const res = await syncGithubRewards()
+      await queryClient.invalidateQueries({ queryKey: ['rewards'] })
+      setSyncInfo(
+        res.total_awarded > 0
+          ? `+${res.total_awarded} pts from ${res.events_scanned} GitHub events`
+          : `Up to date — ${res.events_scanned} events already credited`,
+      )
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'GitHub sync failed. Please try again.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleClaim = async () => {
+    if (busy || !dailyClaim?.available) return
+    setBusy(true)
+    setActionError(null)
+    setClaimInfo(null)
+    try {
+      const res = await claimDailyPoints()
+      await queryClient.invalidateQueries({ queryKey: ['rewards'] })
+      setClaimInfo(res.awarded ? `+${res.points} pts claimed` : 'Already claimed today')
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not claim points.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const confirmRedeem = async (date: string, time: string, topic: string) => {
+    const mentor = selectedMentor
+    if (!mentor || points < mentor.cost || busy) return
+    setBusy(true)
+    setActionError(null)
     const booking: MentorBooking = {
       id: Date.now(),
-      mentorId: selectedMentor.id,
-      mentorName: selectedMentor.name,
-      tier: selectedMentor.tier,
+      mentorId: mentor.id,
+      mentorName: mentor.name,
+      tier: mentor.tier,
       date,
       time,
       topic: topic.trim(),
-      cost: selectedMentor.cost,
+      cost: mentor.cost,
     }
-    setPoints((p) => p - selectedMentor.cost)
-    setBookings((b) => [booking, ...b])
-    setRedeemed(booking)
-    setSelectedMentor(null)
+    try {
+      const res = await redeemPoints({
+        amount: mentor.cost,
+        mentor_id: mentor.id,
+        mentor_name: mentor.name,
+        tier: mentor.tier,
+        date,
+        time,
+        topic: topic.trim(),
+      })
+      booking.referenceKey = res.redemption.reference_key
+      await queryClient.invalidateQueries({ queryKey: ['rewards'] })
+      setRedeemed(booking)
+      setSelectedMentor(null)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Redemption failed. Please try again.')
+    } finally {
+      setBusy(false)
+    }
   }
 
-  const cancelBooking = (id: number) => {
-    const booking = bookings.find((b) => b.id === id)
+  const cancelBooking = async (id: number) => {
+    const booking = allBookings.find((b) => b.id === id)
     if (!booking) return
     if (!window.confirm(`Cancel the session with ${booking.mentorName}? Points will be refunded.`)) return
-    setPoints((p) => p + booking.cost)
-    setBookings((current) => current.filter((b) => b.id !== id))
+    if (!booking.referenceKey) return
+    setBusy(true)
+    setActionError(null)
+    try {
+      await cancelRedemption(booking.referenceKey)
+      await queryClient.invalidateQueries({ queryKey: ['rewards'] })
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not cancel the session.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   const nextTier = useMemo(() => {
-    const unlocked = (Object.entries(TIER_COSTS) as [MentorTier, number][]).filter(
+    const unlocked = (Object.entries(tierCosts) as [MentorTier, number][]).filter(
       ([, cost]) => points >= cost,
     ).length
     const order: MentorTier[] = ['beginner', 'intermediate', 'advanced', 'expert']
-    const next = order.find((tier) => points < TIER_COSTS[tier])
-    return { unlocked, next, nextCost: next ? TIER_COSTS[next] : null }
-  }, [points])
+    const next = order.find((tier) => points < tierCosts[tier])
+    return { unlocked, next, nextCost: next ? tierCosts[next] : null }
+  }, [points, tierCosts])
 
   const totalSpent = useMemo(
-    () => bookings.reduce((sum, b) => sum + b.cost, 0),
-    [bookings],
+    () => allBookings.reduce((sum, b) => sum + b.cost, 0),
+    [allBookings],
   )
 
   return (
@@ -314,18 +330,90 @@ export function RedeemSection() {
             <Sparkles className="size-4" aria-hidden="true" />
             {points.toLocaleString()} pts
           </p>
+          <p className="font-mono text-[10px] text-muted-foreground">
+            {signedIn ? 'synced with backend' : 'sign in to redeem'}
+          </p>
+          {signedIn && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleGithubSync}
+              disabled={busy}
+              className="gap-1.5"
+            >
+              <RefreshCw className={cn('size-3.5', busy && 'animate-spin')} aria-hidden="true" />
+              Sync GitHub points
+            </Button>
+          )}
+          {syncInfo && (
+            <p className="font-mono text-[10px] font-semibold text-emerald-400">{syncInfo}</p>
+          )}
         </div>
       </div>
 
-      {/* Preview notice */}
-      <div className="flex items-center gap-2.5 rounded-lg border border-accent/20 bg-accent/5 px-4 py-2.5 text-xs text-muted-foreground">
-        <Badge variant="accent" className="shrink-0 text-[10px]">
-          Preview Mode
-        </Badge>
-        <span className="flex-1">
-          Points balance and bookings are stored locally for now. The rewards backend API integration is coming soon.
-        </span>
-      </div>
+      {/* Sign-in / load error notices */}
+      {!signedIn && (
+        <div className="flex items-center gap-2.5 rounded-lg border border-accent/20 bg-accent/5 px-4 py-2.5 text-xs text-muted-foreground">
+          <Badge variant="accent" className="shrink-0 text-[10px]">
+            Sign in required
+          </Badge>
+          <span className="flex-1">
+            Redeeming mentor sessions needs an account. Sign in to see your balance, claim daily points, and book sessions.
+          </span>
+        </div>
+      )}
+      {signedIn && summaryError && (
+        <div
+          role="alert"
+          className="flex items-center gap-2.5 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-2.5 text-xs text-red-400"
+        >
+          Could not load your rewards balance. Please try again.
+        </div>
+      )}
+      {actionError && (
+        <div role="alert" className="flex items-center gap-2.5 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-2.5 text-xs text-red-400">
+          {actionError}
+        </div>
+      )}
+
+      {/* Daily claim */}
+      {signedIn && dailyClaim && (
+        <Card className="border-accent/30">
+          <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <span className="flex size-10 shrink-0 items-center justify-center rounded-md border border-accent/40 bg-accent/10 text-accent-text">
+                <Gift className="size-5" aria-hidden="true" />
+              </span>
+              <div>
+                <p className="text-sm font-semibold text-foreground">{dailyClaim.label}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {dailyClaim.available
+                    ? `Claim ${dailyClaim.points} points for today.`
+                    : `Already claimed — next claim ${
+                        dailyClaim.next_available_at
+                          ? formatClaimReset(dailyClaim.next_available_at)
+                          : 'tomorrow'
+                      }.`}
+                </p>
+                {claimInfo && (
+                  <p className="mt-0.5 font-mono text-[11px] font-semibold text-emerald-400">
+                    {claimInfo}
+                  </p>
+                )}
+              </div>
+            </div>
+            <Button
+              size="sm"
+              onClick={() => void handleClaim()}
+              disabled={busy || !dailyClaim.available}
+              className="shrink-0 gap-1.5"
+            >
+              <Sparkles className="size-3.5" aria-hidden="true" />
+              {dailyClaim.available ? `Claim +${dailyClaim.points} pts` : 'Claimed'}
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Tier summary + progress */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -335,7 +423,7 @@ export function RedeemSection() {
               <div>
                 <CardTitle>MENTOR TIERS</CardTitle>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {nextTier.unlocked} of {Object.keys(TIER_COSTS).length} tiers unlocked with your current balance.
+                  {nextTier.unlocked} of {Object.keys(tierCosts).length} tiers unlocked with your current balance.
                 </p>
               </div>
               <Gift className="size-5 text-accent-text" aria-hidden="true" />
@@ -344,7 +432,7 @@ export function RedeemSection() {
           <CardContent className="grid grid-cols-2 gap-3 p-4 sm:p-5 xl:grid-cols-4">
             {(Object.entries(TIER_META) as [MentorTier, (typeof TIER_META)[MentorTier]][]).map(
               ([tier, meta]) => {
-                const affordable = points >= TIER_COSTS[tier]
+                const affordable = points >= tierCosts[tier]
                 const Icon = meta.Icon
                 return (
                   <div
@@ -369,7 +457,7 @@ export function RedeemSection() {
                     </div>
                     <p className="mt-2.5 text-xs font-semibold">{meta.label}</p>
                     <p className="mt-1 font-mono text-sm font-bold text-accent-text">
-                      {TIER_COSTS[tier]} pts
+                      {tierCosts[tier]} pts
                     </p>
                     <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
                       {meta.blurb}
@@ -396,7 +484,7 @@ export function RedeemSection() {
             </div>
             <div className="flex items-baseline justify-between">
               <span className="text-xs text-muted-foreground">Sessions booked</span>
-              <span className="font-mono text-lg font-bold">{bookings.length}</span>
+              <span className="font-mono text-lg font-bold">{allBookings.length}</span>
             </div>
             {nextTier.next && nextTier.nextCost && (
               <div className="rounded-lg border border-border bg-background p-3">
@@ -521,7 +609,7 @@ export function RedeemSection() {
             >
               All mentors
             </button>
-            {ALL_TAGS.map((tag) => (
+            {tagOptions.map((tag) => (
               <button
                 key={tag}
                 type="button"
@@ -538,7 +626,9 @@ export function RedeemSection() {
             ))}
           </div>
 
-          {filtered.length === 0 ? (
+          {mentorsLoading ? (
+            <p className="py-6 text-center text-xs text-muted-foreground">Loading mentors…</p>
+          ) : filtered.length === 0 ? (
             <EmptyState
               icon={Users}
               title="No mentors for this topic"
@@ -626,7 +716,7 @@ export function RedeemSection() {
       </Card>
 
       {/* Booking history */}
-      {bookings.length > 0 && (
+      {allBookings.length > 0 && (
         <Card>
           <CardHeader className="border-b border-border">
             <div className="flex items-center justify-between gap-4">
@@ -640,7 +730,7 @@ export function RedeemSection() {
             </div>
           </CardHeader>
           <CardContent className="space-y-2.5 p-4 sm:p-5">
-            {[...bookings]
+            {[...allBookings]
               .sort((a, b) => b.id - a.id)
               .map((booking) => (
                 <div

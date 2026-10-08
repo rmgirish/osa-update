@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { tutorials } from '@/data/git-assist-tutorials'
 import { categories, knowledge } from '@/data/git-assist-knowledge'
 import { useAuthStore } from '@/lib/auth-store'
+import { awardTutorialCompletion } from '@/lib/rewards-api'
 import { cn } from '@/lib/utils'
 import './LearningSection.css'
 
@@ -144,6 +145,13 @@ export function LearningSection() {
     if (step + 1 < tutorial.steps.length) {
       setStep((value) => value + 1)
       return
+    }
+    // Credit reward points for finishing this module. The backend is
+    // idempotent per tutorial, and failures must never block the learner.
+    if (!completed.includes(tutorial.id)) {
+      awardTutorialCompletion({ tutorial_id: tutorial.id, tutorial_title: tutorial.title }).catch(
+        () => undefined,
+      )
     }
     setCompleted((value) =>
       value.includes(tutorial.id) ? value : [...value, tutorial.id],

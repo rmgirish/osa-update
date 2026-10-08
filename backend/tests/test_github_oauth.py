@@ -1,10 +1,73 @@
 """Unit tests for GitHub OAuth flow and dev PAT endpoints."""
 
+import urllib.parse
+
+import httpx
 import pytest
 from httpx import AsyncClient, ASGITransport
 from backend.main import app
 from backend.core.config import settings
 from backend.services.github_oauth_service import GitHubOAuthService
+
+
+@pytest.mark.asyncio
+async def test_oauth_authorization_and_exchange_use_same_callback_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send the registered callback URI in both steps using form encoding."""
+    callback_uri = "https://app.example.com/api/v1/auth/github/callback"
+    monkeypatch.setattr(settings, "GITHUB_CLIENT_ID", "mock_client_id")
+    monkeypatch.setattr(settings, "GITHUB_CLIENT_SECRET", "mock_client_secret")
+    monkeypatch.setattr(settings, "GITHUB_REDIRECT_URI", callback_uri)
+
+    authorization_url = GitHubOAuthService.get_authorization_url(state="test-state")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(authorization_url).query)
+    assert query["redirect_uri"] == [callback_uri]
+    assert query["state"] == ["test-state"]
+
+    captured_request: httpx.Request | None = None
+
+    async def mock_post(
+        _client: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = httpx.Request("POST", url, data=data, headers=headers)
+        return httpx.Response(200, json={"access_token": "mock_access_token"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    token = await GitHubOAuthService.exchange_code_for_token("mock_code")
+
+    assert token == "mock_access_token"
+    assert captured_request is not None
+    assert captured_request.headers["content-type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+    body = urllib.parse.parse_qs(captured_request.content.decode())
+    assert body["client_id"] == ["mock_client_id"]
+    assert body["client_secret"] == ["mock_client_secret"]
+    assert body["code"] == ["mock_code"]
+    assert body["redirect_uri"] == [callback_uri]
+
+
+def test_oauth_callback_uri_falls_back_to_frontend_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "GITHUB_CLIENT_ID", "mock_client_id")
+    monkeypatch.setattr(settings, "GITHUB_CLIENT_SECRET", "mock_client_secret")
+    monkeypatch.setattr(settings, "GITHUB_REDIRECT_URI", " ")
+    monkeypatch.setattr(settings, "FRONTEND_URL", "https://app.example.com/")
+
+    authorization_url = GitHubOAuthService.get_authorization_url()
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(authorization_url).query)
+
+    assert query["redirect_uri"] == [
+        "https://app.example.com/api/v1/auth/github/callback"
+    ]
 
 
 @pytest.mark.asyncio

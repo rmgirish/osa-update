@@ -4,12 +4,15 @@ import asyncio
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.api.auth import router as auth_router
 from backend.api.admin import router as admin_router
@@ -21,7 +24,9 @@ from backend.api.routes.events import router as events_router
 from backend.api.routes.forum import router as forum_router
 from backend.api.routes.github import router as github_router
 from backend.api.routes.learning import router as learning_router
+from backend.api.routes.mentors import router as mentors_router
 from backend.api.routes.projects import router as projects_router
+from backend.api.routes.rewards import router as rewards_router
 from backend.api.routes.roadmaps import router as roadmaps_router
 from backend.api.routes.search import router as search_router
 from backend.api.routes.users import router as users_router
@@ -100,11 +105,51 @@ app.include_router(events_router, prefix=settings.API_V1_PREFIX)
 app.include_router(airflow_router, prefix=settings.API_V1_PREFIX)
 app.include_router(users_router, prefix=settings.API_V1_PREFIX)
 app.include_router(roadmaps_router, prefix=settings.API_V1_PREFIX)
+app.include_router(rewards_router, prefix=settings.API_V1_PREFIX)
+app.include_router(mentors_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict[str, str]:
     return {"status": "healthy", "service": "open-source-assist-backend"}
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (production single-service deployment)
+# ---------------------------------------------------------------------------
+# When a production build exists at ``frontend/dist`` (``npm run build``), the
+# backend serves it from the same origin as the API so the UI and backend run as
+# one service. In development the Vite dev server proxies ``/api`` instead and
+# this block is simply inert.
+_FRONTEND_DIST = (Path(__file__).resolve().parents[1] / "frontend" / "dist").resolve()
+
+if (_FRONTEND_DIST / "assets").is_dir():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_FRONTEND_DIST / "assets")),
+        name="assets",
+    )
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str) -> FileResponse:
+    """Serve built static files, falling back to index.html for SPA routes."""
+    # Never shadow the API or the docs endpoints with the SPA entrypoint.
+    if full_path.startswith(("api/", "docs", "redoc", "openapi.json")):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if full_path:
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        if _FRONTEND_DIST in candidate.parents and candidate.is_file():
+            return FileResponse(candidate)
+
+    index = _FRONTEND_DIST / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    raise HTTPException(
+        status_code=404,
+        detail="Frontend build not found. Run 'npm run build' in frontend/.",
+    )
 
 
 if __name__ == "__main__":

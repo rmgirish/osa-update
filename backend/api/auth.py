@@ -3,6 +3,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.dependencies import get_current_user
@@ -48,11 +49,17 @@ async def signup(
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("Signup failed: database unreachable: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Our servers are having trouble reaching the database. Please try again in a moment.",
+        ) from exc
     except Exception as exc:
         logger.error("Signup dispatch failed unexpectedly: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to send verification code. Please check your network and try again.",
+            detail="Something went wrong while sending your verification code. Please try again.",
         ) from exc
     return MessageResponse(message="Verification code sent to your email")
 
@@ -69,6 +76,12 @@ async def verify_signup_otp(
         token = await AuthService.verify_signup_otp(db, payload.email, payload.otp)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("Signup verification failed: database unreachable: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Our servers are having trouble reaching the database. Please try again in a moment.",
+        ) from exc
     except Exception as exc:
         logger.error("Signup verification failed unexpectedly: %s", exc, exc_info=True)
         raise HTTPException(
@@ -86,12 +99,36 @@ async def login(
     payload: LoginRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> TokenResponse:
-    """Verify user credentials and return signed access token."""
+    """Verify user credentials and return a signed access token.
+
+    ``remember_me=true`` issues a 1-day token instead of the two-hour default.
+    """
     try:
-        token = await AuthService.login(db, payload.email, payload.password)
+        token, user, expires_at = await AuthService.login(
+            db, payload.email, payload.password, remember_me=payload.remember_me
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
-    return TokenResponse(access_token=token)
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("Login failed: database unreachable: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Our servers are having trouble reaching the database. Please try again in a moment.",
+        ) from exc
+    return TokenResponse(
+        access_token=token,
+        user=UserProfileResponse(
+            id=str(user.id),
+            email=user.email,
+            username=user.username,
+            github_username=user.github_username,
+            skill_level=user.skill_level,
+            user_context=user.user_context,
+            role=getattr(user, "role", "user"),
+            account_status=getattr(user, "account_status", "active"),
+        ),
+        expires_at=expires_at,
+    )
 
 
 @router.post("/forgot-password", response_model=MessageResponse, status_code=status.HTTP_200_OK)
@@ -100,7 +137,14 @@ async def forgot_password(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MessageResponse:
     """Issue a password-reset OTP without leaking account existence."""
-    await AuthService.request_password_reset(db, payload.email)
+    try:
+        await AuthService.request_password_reset(db, payload.email)
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("Password reset request failed: database unreachable: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Our servers are having trouble reaching the database. Please try again in a moment.",
+        ) from exc
     return MessageResponse(message="If the account exists, a reset code has been sent")
 
 
@@ -114,6 +158,12 @@ async def reset_password(
         await AuthService.reset_password(db, payload.email, payload.otp, payload.new_password)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("Password reset failed: database unreachable: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Our servers are having trouble reaching the database. Please try again in a moment.",
+        ) from exc
     return MessageResponse(message="Password reset successfully")
 
 
@@ -192,6 +242,7 @@ async def github_oauth_callback(
             "username": user.username or profile.get("login", ""),
             "email": user.email,
             "avatar_url": profile.get("avatar_url", ""),
+            "state": state or "",
         }
         return RedirectResponse(
             url=f"{settings.FRONTEND_URL}/?{urllib.parse.urlencode(params)}"
@@ -241,6 +292,13 @@ async def github_pat_login(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AuthResponse:
     """Log in using the connected GitHub PAT profile in development."""
+    # Development-only convenience: in production this endpoint would let
+    # anyone sign in as the server's GitHub account, so it is disabled.
+    if settings.ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not available in production",
+        )
     if not settings.GITHUB_TOKEN or not settings.GITHUB_TOKEN.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -13,7 +13,7 @@ from backend.core.database import Base
 from backend.models import OTP, User  # noqa: F401 (register metadata)
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -23,7 +23,7 @@ target_metadata = Base.metadata
 def run_migrations_offline() -> None:
     """Run migrations without creating a database connection."""
     context.configure(
-        url=settings.DATABASE_URL,
+        url=settings.database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

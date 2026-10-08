@@ -9,6 +9,8 @@ from backend.models.roadmap import Roadmap
 from backend.models.roadmap_step import RoadmapStep
 from backend.models.user_roadmap_progress import UserRoadmapProgress
 from backend.models.forum_model import ForumThread, ForumPost, ForumBan
+from backend.models.reward_model import RewardLedger
+from backend.models.mentor_model import Mentor
 
 __all__ = [
     "OTP",
@@ -23,4 +25,6 @@ __all__ = [
     "ForumThread",
     "ForumPost",
     "ForumBan",
+    "RewardLedger",
+    "Mentor",
 ]

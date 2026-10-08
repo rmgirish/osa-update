@@ -16,18 +16,23 @@ def upgrade() -> None:
     op.create_table(
         "events",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("name", sa.String(length=200), nullable=False),
-        sa.Column("type", sa.String(length=50), nullable=False),
-        sa.Column("date", sa.Date(), nullable=False),
-        sa.Column("time", sa.Time(), nullable=False),
-        sa.Column("mode", sa.String(length=20), nullable=False),
-        sa.Column("location", sa.String(length=255), nullable=False, server_default=""),
-        sa.Column("organizer", sa.String(length=150), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False, server_default="Untitled Event"),
+        sa.Column("company_organization", sa.String(length=255), nullable=False),
+        sa.Column("event_type", sa.String(length=100), nullable=False),
+        sa.Column("description", sa.Text(), nullable=False),
+        sa.Column("mode", sa.String(length=50), nullable=False),
+        sa.Column("location", sa.String(length=500), nullable=True),
+        sa.Column("event_date", sa.Date(), nullable=False),
+        sa.Column("event_time", sa.Time(), nullable=False),
+        sa.Column("application_url", sa.String(length=1000), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_events_date", "events", ["date"], unique=False)
+    op.create_index("ix_events_name", "events", ["name"], unique=False)
+    op.create_index("ix_events_company_organization", "events", ["company_organization"], unique=False)
+    op.create_index("ix_events_event_type", "events", ["event_type"], unique=False)
+    op.create_index("ix_events_mode", "events", ["mode"], unique=False)
+    op.create_index("ix_events_event_date", "events", ["event_date"], unique=False)
     op.create_table(
         "forum_threads",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
@@ -72,5 +77,9 @@ def downgrade() -> None:
     op.drop_table("forum_posts")
     op.drop_index("ix_forum_threads_author_id", table_name="forum_threads")
     op.drop_table("forum_threads")
-    op.drop_index("ix_events_date", table_name="events")
+    op.drop_index("ix_events_event_date", table_name="events")
+    op.drop_index("ix_events_mode", table_name="events")
+    op.drop_index("ix_events_event_type", table_name="events")
+    op.drop_index("ix_events_company_organization", table_name="events")
+    op.drop_index("ix_events_name", table_name="events")
     op.drop_table("events")

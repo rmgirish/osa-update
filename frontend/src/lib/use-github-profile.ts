@@ -7,13 +7,13 @@ export interface GitHubUserProfile {
   name: string
   avatar_url: string
   html_url: string
-  bio: string
+  bio: string | null
   company?: string | null
   location?: string | null
   public_repos: number
   followers: number
   following: number
-  created_at: string
+  created_at: string | null
 }
 
 export interface GitHubUserStats {
@@ -82,27 +82,32 @@ export interface GitHubUserFullData {
   badges: GitHubBadge[]
   recent_activity: GitHubRecentActivity[]
   heatmap: GitHubHeatmapDay[]
+  /** True when GitHub rate limiting degraded this snapshot to stale data. */
+  rate_limited?: boolean
 }
 
 export function useGitHubUserProfile() {
   const user = useAuthStore((s) => s.user)
   const updateUser = useAuthStore((s) => s.updateUser)
+  // Resolve the GitHub handle strictly from the signed-in user's own data.
+  // Never fall back to a hardcoded account — that would show someone else's
+  // stats to users who have not connected GitHub yet.
   const username =
-    user?.github_username ||
-    (user?.username && !user.username.includes('@') ? user.username : null) ||
-    (user?.email === 'a.arul.ananth.2006@gmail.com' ? 'Arul-Ananth' : null) ||
-    (user?.email ? user.email.split('@')[0] : null) ||
-    'Arul-Ananth'
+    user?.github_username?.trim() ||
+    (user?.username && !user.username.includes('@') ? user.username.trim() : null) ||
+    null
 
   const query = useQuery<GitHubUserFullData>({
-    queryKey: ['github-user-profile', username],
+    queryKey: ['github-user-profile', username ?? 'not-connected'],
     queryFn: async () => {
+      if (!username) throw new Error('No GitHub account connected')
       const res = await fetch(`/api/v1/github/user-profile/${encodeURIComponent(username)}`)
       if (!res.ok) {
         throw new Error(`Failed to load GitHub user profile (HTTP ${res.status})`)
       }
       return await res.json()
     },
+    enabled: !!username,
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
   })

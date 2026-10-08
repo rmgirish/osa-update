@@ -104,3 +104,8 @@ airflow.db
 airflow.cfg
 airflow-webserver.pid
 logs/
+
+# =========================
+# Local data artifacts (Qdrant local storage, scratch DBs)
+# =========================
+data/

@@ -1,0 +1,45 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Key & Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER || 'ubuntu' }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          APP_DIR: ${{ secrets.EC2_APP_DIR || '/home/ubuntu/open-source-assist' }}
+        run: |
+          if [ -z "$EC2_HOST" ] || [ -z "$EC2_SSH_KEY" ]; then
+            echo "Skipping EC2 deployment: EC2_HOST or EC2_SSH_KEY secret is not configured."
+            exit 0
+          fi
+
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add EC2 host to known_hosts
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+          # Execute remote update and deployment
+          ssh "$EC2_USER@$EC2_HOST" "mkdir -p $APP_DIR"
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '.venv' \
+            --exclude 'node_modules' \
+            --exclude '__pycache__' \
+            --exclude '.pytest_cache' \
+            ./ "$EC2_USER@$EC2_HOST:$APP_DIR/"
+
+          ssh "$EC2_USER@$EC2_HOST" "cd $APP_DIR && chmod +x devops/*.sh && bash devops/deploy.sh"

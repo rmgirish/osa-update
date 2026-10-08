@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     )
 
     # PostgreSQL Database Configuration
+    # Optional full async database URL (e.g. postgresql+asyncpg://user:pass@host/db
+    # or sqlite+aiosqlite:///./app.db). When set, it overrides the POSTGRES_* fields.
+    DATABASE_URL: str | None = Field(
+        default=None,
+        description="Optional explicit async SQLAlchemy database URL. Overrides POSTGRES_* fields.",
+    )
     POSTGRES_HOST: str = Field(
         default="localhost",
         description="PostgreSQL host (e.g. AWS RDS endpoint).",
@@ -54,8 +60,10 @@ class Settings(BaseSettings):
     )
 
     @property
-    def DATABASE_URL(self) -> str:
-        """Construct the async PostgreSQL connection URL from individual fields."""
+    def database_url(self) -> str:
+        """Resolve the async database URL: explicit DATABASE_URL wins over POSTGRES_* fields."""
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
@@ -69,6 +77,11 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT signing algorithm.")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(
         default=120, ge=1, description="Access-token lifetime in minutes.",
+    )
+    REMEMBER_ME_EXPIRE_MINUTES: int = Field(
+        default=1440,
+        ge=1,
+        description="Access-token lifetime in minutes when 'Remember me' is checked (1 day).",
     )
     OTP_EXPIRE_MINUTES: int = Field(
         default=5, ge=1, description="Password-reset OTP lifetime in minutes.",
@@ -138,6 +151,10 @@ class Settings(BaseSettings):
     )
     QDRANT_VECTOR_SIZE: int = Field(
         default=384, description="Vector dimension matching the embedding model.",
+    )
+    QDRANT_TIMEOUT_SECONDS: float = Field(
+        default=2.0,
+        description="Socket probe and connection timeout for Qdrant server in seconds.",
     )
 
     # Embedding Configuration

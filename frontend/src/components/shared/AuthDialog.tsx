@@ -58,8 +58,12 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
 
   const [pendingEmail, setPendingEmail] = React.useState('')
   const [pendingUsername, setPendingUsername] = React.useState('')
+  // null = unknown (not yet probed), true/false = GitHub OAuth availability.
+  const [githubConfigured, setGithubConfigured] = React.useState<boolean | null>(null)
 
-  // Reset to the requested tab every time the dialog opens.
+  // Reset to the requested tab every time the dialog opens, and probe whether
+  // GitHub OAuth is configured so the button can be disabled with an
+  // explanation instead of failing on click.
   React.useEffect(() => {
     if (open) {
       setScreen(initialMode)
@@ -67,6 +71,12 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
       setGeneralError(null)
       setSuccessMsg(null)
       setLoading(false)
+      setGithubConfigured(null)
+      useAuthStore
+        .getState()
+        .getGitHubOAuthUrl()
+        .then((data) => setGithubConfigured(data.configured))
+        .catch(() => setGithubConfigured(null))
     }
   }, [open, initialMode])
 
@@ -134,7 +144,8 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
       } else {
         const email = String(formData.get('login-email') ?? '').trim()
         const password = String(formData.get('login-password') ?? '')
-        await useAuthStore.getState().login(email, password)
+        const rememberMe = formData.get('remember-me') === 'on'
+        await useAuthStore.getState().login(email, password, rememberMe)
         onClose()
       }
     } catch (err: unknown) {
@@ -149,7 +160,18 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
     setGeneralError(null)
     setLoading(true)
     try {
-      const data = await useAuthStore.getState().getGitHubOAuthUrl()
+      // CSRF protection: generate a one-time state, remember it, and have the
+      // callback round-trip it back so the SPA can verify the redirect.
+      const state =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID().replace(/-/g, '')
+          : Math.random().toString(36).slice(2) + Date.now().toString(36)
+      try {
+        sessionStorage.setItem('osa-oauth-state', state)
+      } catch {
+        /* storage unavailable — proceed without state */
+      }
+      const data = await useAuthStore.getState().getGitHubOAuthUrl(state)
       if (data.configured && data.url) {
         window.location.href = data.url
         return
@@ -540,19 +562,14 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
 
               {isLogin && (
                 <div className="flex items-center justify-between">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const emailInput = document.getElementById('login-email') as HTMLInputElement | null
-                      const passwordInput = document.getElementById('login-password') as HTMLInputElement | null
-                      if (emailInput) emailInput.value = 'demo@opensourceassist.dev'
-                      if (passwordInput) passwordInput.value = 'Password123!'
-                    }}
-                    className="text-[11px] font-mono font-medium text-muted-foreground hover:text-accent-text transition-colors"
-                    title="Fill pre-verified demo credentials"
-                  >
-                    ⚡ Fill Demo Login
-                  </button>
+                  <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      name="remember-me"
+                      className="size-3.5 accent-[var(--color-accent)]"
+                    />
+                    Remember me for 1 day
+                  </label>
                   <button
                     type="button"
                     onClick={() => switchTo('forgot')}
@@ -594,13 +611,20 @@ export function AuthDialog({ open, onClose, initialMode = 'login' }: AuthDialogP
             <Button
               type="button"
               variant="secondary"
-              disabled={loading}
+              disabled={loading || githubConfigured === false}
               onClick={handleGitHubAuth}
               className="mt-2.5 h-9 w-full"
             >
               <GitBranch className="size-4" aria-hidden="true" />
               {loading ? 'Connecting to GitHub...' : 'Continue with GitHub'}
             </Button>
+
+            {githubConfigured === false && (
+              <p className="mt-2 text-center text-[11px] leading-snug text-muted-foreground">
+                GitHub sign-in isn't configured on this server yet — the
+                administrator needs to set up a GitHub OAuth App.
+              </p>
+            )}
 
             <p className="auth-switch mt-3 text-center text-xs text-muted-foreground">
               {isLogin ? "Don't have an account? " : 'Already have an account? '}
